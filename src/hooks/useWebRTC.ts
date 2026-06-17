@@ -20,7 +20,7 @@ const ICE_SERVERS = [
   { urls: 'stun:stun1.l.google.com:19302' },
 ];
 
-export function useWebRTC(_roomId: string | null): UseWebRTCReturn {
+export function useWebRTC(_roomId: string | null, _processedStream: MediaStream | null): UseWebRTCReturn {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [cameraEnabled, setCameraEnabled] = useState(true);
   const [microphoneEnabled, setMicrophoneEnabled] = useState(true);
@@ -28,6 +28,11 @@ export function useWebRTC(_roomId: string | null): UseWebRTCReturn {
   const peerConnections = useRef<Map<string, RTCPeerConnection>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
   const roomIdRef = useRef<string | null>(null);
+  const processedStreamRef = useRef<MediaStream | null>(null);
+
+  useEffect(() => {
+    processedStreamRef.current = _processedStream;
+  }, [_processedStream]);
 
   const startLocalStream = useCallback(async () => {
     try {
@@ -53,8 +58,9 @@ export function useWebRTC(_roomId: string | null): UseWebRTCReturn {
   }, []);
 
   const toggleCamera = useCallback(() => {
-    if (localStreamRef.current) {
-      const videoTrack = localStreamRef.current.getVideoTracks()[0];
+    const stream = localStreamRef.current;
+    if (stream) {
+      const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) {
         videoTrack.enabled = !videoTrack.enabled;
         setCameraEnabled(videoTrack.enabled);
@@ -67,8 +73,9 @@ export function useWebRTC(_roomId: string | null): UseWebRTCReturn {
   }, []);
 
   const toggleMicrophone = useCallback(() => {
-    if (localStreamRef.current) {
-      const audioTrack = localStreamRef.current.getAudioTracks()[0];
+    const stream = localStreamRef.current;
+    if (stream) {
+      const audioTrack = stream.getAudioTracks()[0];
       if (audioTrack) {
         audioTrack.enabled = !audioTrack.enabled;
         setMicrophoneEnabled(audioTrack.enabled);
@@ -78,6 +85,10 @@ export function useWebRTC(_roomId: string | null): UseWebRTCReturn {
         });
       }
     }
+  }, []);
+
+  const getActiveStream = useCallback(() => {
+    return processedStreamRef.current || localStreamRef.current;
   }, []);
 
   const createPeerConnection = useCallback((userId: string) => {
@@ -111,9 +122,10 @@ export function useWebRTC(_roomId: string | null): UseWebRTCReturn {
       });
     };
 
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current!);
+    const streamToSend = processedStreamRef.current || localStreamRef.current;
+    if (streamToSend) {
+      streamToSend.getTracks().forEach((track) => {
+        pc.addTrack(track, streamToSend);
       });
     }
 

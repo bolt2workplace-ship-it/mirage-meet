@@ -53,16 +53,42 @@ app.post('/create-room', (req, res) => {
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  socket.on('create-room', () => {
-    const roomId = generateRoomId();
+  socket.on('create-room', ({ roomId: requestedRoomId, displayName }) => {
+    const roomId = requestedRoomId || generateRoomId();
+
+    if (rooms.has(roomId)) {
+      const existingRoom = rooms.get(roomId);
+      if (existingRoom.admin === null) {
+        existingRoom.admin = socket.id;
+        existingRoom.participants.set(socket.id, {
+          id: socket.id,
+          isAdmin: true,
+          displayName: displayName || 'Host',
+          cameraEnabled: true,
+          microphoneEnabled: true,
+        });
+        socket.join(roomId);
+        socket.emit('room-created', { roomId, isAdmin: true, displayName: displayName || 'Host' });
+      } else {
+        socket.emit('error', { message: 'Room already exists' });
+      }
+      return;
+    }
+
     rooms.set(roomId, {
       id: roomId,
       admin: socket.id,
-      participants: new Map([[socket.id, { id: socket.id, isAdmin: true, displayName: 'Host' }]]),
+      participants: new Map([[socket.id, {
+        id: socket.id,
+        isAdmin: true,
+        displayName: displayName || 'Host',
+        cameraEnabled: true,
+        microphoneEnabled: true,
+      }]]),
     });
     socket.join(roomId);
-    socket.emit('room-created', { roomId, isAdmin: true });
-    console.log('Room created:', roomId);
+    socket.emit('room-created', { roomId, isAdmin: true, displayName: displayName || 'Host' });
+    console.log('Room created:', roomId, 'by', socket.id);
   });
 
   socket.on('join-room', ({ roomId, displayName }) => {
@@ -72,30 +98,30 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const isAdmin = room.admin === null || room.admin === socket.id;
-    if (isAdmin && room.admin === null) {
-      room.admin = socket.id;
-    }
+    const isAdmin = room.admin === socket.id;
+    const participantName = displayName || 'Guest';
 
     room.participants.set(socket.id, {
       id: socket.id,
       isAdmin,
-      displayName: displayName || 'Guest',
+      displayName: participantName,
+      cameraEnabled: true,
+      microphoneEnabled: true,
     });
 
     socket.join(roomId);
     socket.emit('room-joined', {
       roomId,
       isAdmin,
-      participant: { id: socket.id, isAdmin, displayName: displayName || 'Guest' },
+      participant: { id: socket.id, isAdmin, displayName: participantName },
       participants: Array.from(room.participants.values()),
     });
 
     socket.to(roomId).emit('user-joined', {
-      user: { id: socket.id, isAdmin, displayName: displayName || 'Guest' },
+      user: { id: socket.id, isAdmin, displayName: participantName, cameraEnabled: true, microphoneEnabled: true },
     });
 
-    console.log('User joined room:', roomId, socket.id);
+    console.log('User joined room:', roomId, socket.id, 'as', participantName);
   });
 
   socket.on('signal', ({ to, signal }) => {

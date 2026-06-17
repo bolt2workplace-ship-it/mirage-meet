@@ -1,4 +1,4 @@
-import { Upload, X, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Upload, X, ChevronLeft, ChevronRight, CheckCircle, AlertCircle, Loader } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
 import type { TransformationSettings } from '../types';
 import { backgroundOptions } from '../hooks/useFaceTransform';
@@ -11,6 +11,7 @@ interface TransformPanelProps {
   onBackgroundChange: (backgroundId: string) => void;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
+  statusMessage: string;
 }
 
 export default function TransformPanel({
@@ -21,9 +22,11 @@ export default function TransformPanel({
   onBackgroundChange,
   isCollapsed,
   onToggleCollapse,
+  statusMessage,
 }: TransformPanelProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const videoInputRef = useRef<HTMLInputElement>(null);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
 
@@ -36,6 +39,7 @@ export default function TransformPanel({
   }, [previewUrl]);
 
   const handleVideoUpload = (file: File) => {
+    setUploadStatus('loading');
     if (previewUrl) {
       URL.revokeObjectURL(previewUrl);
     }
@@ -47,7 +51,16 @@ export default function TransformPanel({
     video.loop = true;
     video.muted = true;
     video.playsInline = true;
-    video.play();
+
+    video.onloadeddata = () => {
+      video.play().catch(() => {});
+      setUploadStatus('success');
+    };
+
+    video.onerror = () => {
+      setUploadStatus('error');
+    };
+
     setReferenceVideo(video);
 
     setTransformationSettings(prev => ({
@@ -77,6 +90,7 @@ export default function TransformPanel({
       URL.revokeObjectURL(previewUrl);
     }
     setPreviewUrl(null);
+    setUploadStatus('idle');
     setReferenceVideo(null);
     setTransformationSettings(prev => ({
       ...prev,
@@ -90,6 +104,19 @@ export default function TransformPanel({
       ...prev,
       enabled: !prev.enabled,
     }));
+  };
+
+  const getStatusIcon = () => {
+    if (statusMessage.includes('Loading') || uploadStatus === 'loading') {
+      return <Loader size={14} className="text-yellow-400 animate-spin" />;
+    }
+    if (statusMessage.includes('Active') || statusMessage.includes('Ready') || statusMessage.includes('Success')) {
+      return <CheckCircle size={14} className="text-green-400" />;
+    }
+    if (statusMessage.includes('Failed') || statusMessage.includes('Error')) {
+      return <AlertCircle size={14} className="text-red-400" />;
+    }
+    return null;
   };
 
   return (
@@ -112,10 +139,15 @@ export default function TransformPanel({
       </button>
 
       <div className="h-full overflow-y-auto p-4">
-        <h2 className="text-lg font-semibold text-white mb-4">Transformation Controls</h2>
-        <p className="text-xs text-dark-400 mb-6">
+        <h2 className="text-lg font-semibold text-white mb-2">Transformation Controls</h2>
+        <p className="text-xs text-dark-400 mb-4">
           Upload a reference video to enable face transformation. Only visible to you.
         </p>
+
+        <div className="mb-4 flex items-center gap-2 px-3 py-2 bg-dark-800 rounded-lg">
+          {getStatusIcon()}
+          <span className="text-xs text-dark-300">{statusMessage}</span>
+        </div>
 
         <div className="space-y-6">
           <div>
@@ -125,7 +157,7 @@ export default function TransformPanel({
             <div
               className={`relative border-2 border-dashed rounded-lg p-4 transition-colors ${
                 isDragging ? 'border-primary-400 bg-primary-400/10' : 'border-dark-600'
-              } ${transformationSettings.referenceVideo ? 'border-primary-500' : ''}`}
+              } ${previewUrl ? 'border-primary-500' : ''}`}
               onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
               onDragLeave={() => setIsDragging(false)}
               onDrop={handleDrop}
@@ -142,6 +174,18 @@ export default function TransformPanel({
                     muted
                     playsInline
                   />
+                  {uploadStatus === 'success' && (
+                    <div className="absolute top-2 left-2 px-2 py-1 bg-green-500/80 rounded text-xs text-white flex items-center gap-1">
+                      <CheckCircle size={12} />
+                      Upload Successful
+                    </div>
+                  )}
+                  {uploadStatus === 'error' && (
+                    <div className="absolute top-2 left-2 px-2 py-1 bg-red-500/80 rounded text-xs text-white flex items-center gap-1">
+                      <AlertCircle size={12} />
+                      Upload Failed
+                    </div>
+                  )}
                   <button
                     onClick={(e) => { e.stopPropagation(); clearVideo(); }}
                     className="absolute top-2 right-2 w-6 h-6 rounded-full bg-red-500 flex items-center justify-center hover:bg-red-600 transition-colors"
@@ -151,13 +195,22 @@ export default function TransformPanel({
                 </div>
               ) : (
                 <div className="flex flex-col items-center justify-center h-32 text-center">
-                  <Upload size={24} className="text-dark-400 mb-2" />
-                  <p className="text-sm text-dark-400">
-                    Drag & drop video or click to upload
-                  </p>
-                  <p className="text-xs text-dark-500 mt-1">
-                    MP4, WebM supported
-                  </p>
+                  {uploadStatus === 'loading' ? (
+                    <div className="flex flex-col items-center">
+                      <Loader size={24} className="text-primary-400 animate-spin mb-2" />
+                      <p className="text-sm text-dark-400">Uploading...</p>
+                    </div>
+                  ) : (
+                    <>
+                      <Upload size={24} className="text-dark-400 mb-2" />
+                      <p className="text-sm text-dark-400">
+                        Drag & drop video or click to upload
+                      </p>
+                      <p className="text-xs text-dark-500 mt-1">
+                        MP4, WebM supported
+                      </p>
+                    </>
+                  )}
                 </div>
               )}
               <input
@@ -194,6 +247,12 @@ export default function TransformPanel({
                       src={bg.thumbnail}
                       alt={bg.name}
                       className="w-full h-full object-cover"
+                      loading="lazy"
+                      onError={(e) => {
+                        const target = e.target as HTMLImageElement;
+                        target.style.display = 'none';
+                        target.parentElement!.innerHTML = `<div class="w-full h-full bg-dark-700 flex items-center justify-center"><span class="text-xs text-dark-400">${bg.name}</span></div>`;
+                      }}
                     />
                   )}
                   <div className="absolute bottom-0 left-0 right-0 bg-dark-900/80 px-2 py-1">
@@ -208,13 +267,20 @@ export default function TransformPanel({
             <div className="pt-4 border-t border-dark-700">
               <button
                 onClick={toggleTransformation}
-                className={`w-full py-3 px-4 rounded-lg font-medium transition-all ${
+                className={`w-full py-3 px-4 rounded-lg font-medium transition-all flex items-center justify-center gap-2 ${
                   transformationSettings.enabled
                     ? 'bg-primary-500 text-white hover:bg-primary-600'
                     : 'bg-dark-700 text-dark-300 hover:bg-dark-600'
                 }`}
               >
-                {transformationSettings.enabled ? 'Transformation Enabled' : 'Enable Transformation'}
+                {transformationSettings.enabled ? (
+                  <>
+                    <CheckCircle size={16} />
+                    Transformation Active
+                  </>
+                ) : (
+                  'Enable Transformation'
+                )}
               </button>
               <p className="text-xs text-dark-400 mt-2 text-center">
                 {transformationSettings.enabled

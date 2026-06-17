@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom';
 import Logo from '../components/Logo';
 import VideoFrame from '../components/VideoFrame';
@@ -14,15 +14,37 @@ export default function Meeting() {
   const { roomId } = useParams<{ roomId: string }>();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const [isHost] = useState(searchParams.get('host') === 'true');
+  const isHost = searchParams.get('host') === 'true';
   const [isAdmin, setIsAdmin] = useState(false);
-  const [displayName, setDisplayName] = useState(() => searchParams.get('name') || 'Guest');
+  const [displayName, setDisplayName] = useState(() => searchParams.get('name') || (isHost ? 'Host' : 'Guest'));
   const [hasJoined, setHasJoined] = useState(false);
   const [meetingDuration, setMeetingDuration] = useState(0);
   const [showInvitePrompt, setShowInvitePrompt] = useState(false);
   const [copied, setCopied] = useState(false);
   const [panelCollapsed, setPanelCollapsed] = useState(false);
   const [waitingForName, setWaitingForName] = useState(searchParams.get('join') === 'true');
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error'>('connecting');
+
+  const transformInitializedRef = useRef(false);
+  const processedStreamRef = useRef<MediaStream | null>(null);
+
+  const {
+    processedStream,
+    transformationSettings,
+    setTransformationSettings,
+    referenceVideo,
+    setReferenceVideo,
+    initializeTransform,
+    updateBackground,
+    statusMessage,
+    cleanup: cleanupTransform,
+  } = useFaceTransform();
+
+  const actualLocalStream = processedStream || null;
+
+  useEffect(() => {
+    processedStreamRef.current = processedStream;
+  }, [processedStream]);
 
   const {
     localStream,
@@ -35,22 +57,9 @@ export default function Meeting() {
     microphoneEnabled,
     initPeerConnections,
     cleanup,
-  } = useWebRTC(roomId || null);
-
-  const {
-    processedStream,
-    transformationSettings,
-    setTransformationSettings,
-    referenceVideo,
-    setReferenceVideo,
-    initializeTransform,
-    updateBackground,
-    cleanup: cleanupTransform,
-  } = useFaceTransform();
+  } = useWebRTC(roomId || null, processedStreamRef.current);
 
   const displayNameRef = useRef<HTMLInputElement>(null);
-
-  const actualLocalStream = transformationSettings.enabled && processedStream ? processedStream : localStream;
 
   useEffect(() => {
     socket.connect();
@@ -61,10 +70,17 @@ export default function Meeting() {
 
   useEffect(() => {
     if (isHost && roomId) {
-      socket.emit('create-room', { roomId });
-      socket.once('room-created', ({ isAdmin: admin }) => {
+      setConnectionStatus('connecting');
+      socket.emit('create-room', { roomId, displayName: 'Host' });
+      socket.once('room-created', ({ isAdmin: admin, displayName: name }) => {
         setIsAdmin(admin);
-        joinMeeting(true);
+        setDisplayName(name);
+        setConnectionStatus('connected');
+        joinMeeting('Host', true);
+      });
+      socket.once('error', ({ message }) => {
+        console.error('Room creation error:', message);
+        setConnectionStatus('error');
       });
     }
   }, [isHost, roomId]);
@@ -79,10 +95,11 @@ export default function Meeting() {
   }, [hasJoined]);
 
   useEffect(() => {
-    if (localStream && transformationSettings.enabled) {
+    if (localStream && !transformInitializedRef.current) {
       initializeTransform(localStream);
+      transformInitializedRef.current = true;
     }
-  }, [localStream, transformationSettings.enabled, initializeTransform]);
+  }, [localStream, initializeTransform]);
 
   const formatDuration = (seconds: number) => {
     const hrs = Math.floor(seconds / 3600);
@@ -94,44 +111,64 @@ export default function Meeting() {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const joinMeeting = async (skipPrompt = false) => {
-    let name = displayName;
+  const joinMeeting = useCallback(async (name: string, skipPrompt = false) => {
     if (!skipPrompt && waitingForName) {
-      name = displayNameRef.current?.value || displayName;
-      setDisplayName(name);
+      const enteredName = displayNameRef.current?.value || name;
+      setDisplayName(enteredName);
     }
     setWaitingForName(false);
 
     try {
-      await startLocalStream();
-      socket.emit('join-room', { roomId, displayName: name });
-      socket.once('room-joined', ({ isAdmin: admin }) => {
-        setIsAdmin(admin);
+      setConnectionStatus('connecting');
+      const stream = await startLocalStream();
+
+      if (!isHost) {
+        socket.emit('join-room', { roomId, displayName: name });
+        socket.once('room-joined', ({ isAdmin: admin, displayName: joinedName }) => {
+          setIsAdmin(admin);
+          setDisplayName(joinedName);
+          setHasJoined(true);
+          setConnectionStatus('connected');
+          if (admin) {
+            setShowInvitePrompt(true);
+            setTimeout(() => setShowInvitePrompt(false), 5000);
+          }
+        });
+        socket.once('error', ({ message }) => {
+          console.error('Join error:', message);
+          setConnectionStatus('error');
+        });
+        initPeerConnections(roomId!);
+      } else {
         setHasJoined(true);
-        if (admin) {
-          setShowInvitePrompt(true);
-          setTimeout(() => setShowInvitePrompt(false), 5000);
-        }
-      });
-      initPeerConnections(roomId!);
+        setShowInvitePrompt(true);
+        setTimeout(() => setShowInvitePrompt(false), 5000);
+        initPeerConnections(roomId!);
+      }
+
+      if (stream && !transformInitializedRef.current) {
+        initializeTransform(stream);
+        transformInitializedRef.current = true;
+      }
     } catch (error) {
       console.error('Failed to join meeting:', error);
+      setConnectionStatus('error');
     }
-  };
+  }, [isHost, waitingForName, roomId, startLocalStream, initializeTransform, initPeerConnections]);
 
-  const leaveMeeting = () => {
+  const leaveMeeting = useCallback(() => {
     cleanup();
     cleanupTransform();
     stopLocalStream();
     socket.disconnect();
     navigate('/');
-  };
+  }, [cleanup, cleanupTransform, stopLocalStream, navigate]);
 
-  const copyInviteLink = () => {
+  const copyInviteLink = useCallback(() => {
     navigator.clipboard.writeText(`${window.location.origin}/meeting/${roomId}?join=true`);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
-  };
+  }, [roomId]);
 
   const allParticipants = Array.from(participants.values());
   const totalParticipants = allParticipants.length + 1;
@@ -157,7 +194,7 @@ export default function Meeting() {
                 className="w-full px-4 py-3 bg-dark-900 border border-dark-600 rounded-lg text-white placeholder-dark-500 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500 transition-all"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
-                    joinMeeting();
+                    joinMeeting(displayNameRef.current?.value || displayName);
                   }
                 }}
               />
@@ -170,7 +207,7 @@ export default function Meeting() {
                 Cancel
               </button>
               <button
-                onClick={() => joinMeeting()}
+                onClick={() => joinMeeting(displayNameRef.current?.value || displayName)}
                 className="flex-1 px-6 py-3 bg-primary-500 hover:bg-primary-600 text-white rounded-lg font-medium transition-colors"
               >
                 Join Meeting
@@ -187,7 +224,14 @@ export default function Meeting() {
       <div className="min-h-screen gradient-dark flex items-center justify-center">
         <div className="flex flex-col items-center gap-4">
           <div className="w-12 h-12 border-4 border-primary-500 border-t-transparent rounded-full animate-spin" />
-          <p className="text-dark-300">Connecting to meeting...</p>
+          <p className="text-dark-300">
+            {connectionStatus === 'error' ? 'Connection failed. Please try again.' : 'Connecting to meeting...'}
+          </p>
+          {connectionStatus === 'error' && (
+            <button onClick={() => navigate('/')} className="px-4 py-2 bg-primary-500 hover:bg-primary-600 rounded-lg text-white">
+              Back to Home
+            </button>
+          )}
         </div>
       </div>
     );
@@ -207,6 +251,10 @@ export default function Meeting() {
         </div>
 
         <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-dark-800 rounded-lg">
+            <div className={`w-2 h-2 rounded-full ${statusMessage.includes('Active') || statusMessage.includes('Ready') ? 'bg-green-500' : statusMessage.includes('Loading') ? 'bg-yellow-500' : 'bg-red-500'}`} />
+            <span className="text-xs text-dark-300">{statusMessage}</span>
+          </div>
           {isAdmin && (
             <button
               onClick={copyInviteLink}
@@ -256,7 +304,7 @@ export default function Meeting() {
             }`}
           >
             <VideoFrame
-              stream={actualLocalStream}
+              stream={actualLocalStream || localStream}
               participant={{
                 id: 'local',
                 displayName,
@@ -285,6 +333,7 @@ export default function Meeting() {
             onBackgroundChange={updateBackground}
             isCollapsed={panelCollapsed}
             onToggleCollapse={() => setPanelCollapsed(!panelCollapsed)}
+            statusMessage={statusMessage}
           />
         )}
       </div>
