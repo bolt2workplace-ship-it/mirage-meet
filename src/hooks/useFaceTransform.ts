@@ -168,37 +168,90 @@ export function useFaceTransform(): UseFaceTransformReturn {
 
   // Initialize ONNX face swap model — loaded lazily so it never blocks page render
   const initFaceSwapModel = useCallback(async () => {
+    const startTime = Date.now();
+    let progressInterval: ReturnType<typeof setInterval> | null = null;
+
     try {
+      console.log('[AI] Starting model load...');
       setStatus('Loading AI transformation model...');
-      setModelLoadProgress(10);
+      setModelLoadProgress(5);
 
       // Dynamically import onnxruntime-web only when needed
+      console.log('[AI] Importing onnxruntime-web...');
       const ort = await import('onnxruntime-web');
       ortRef.current = ort;
-
-      setModelLoadProgress(20);
+      console.log('[AI] onnxruntime-web imported successfully');
+      setModelLoadProgress(15);
 
       // Try WebGPU first, fall back to WASM
       let executionProviders: string[] = ['wasm'];
-      if (typeof navigator !== 'undefined' && navigator.gpu) {
+      if (typeof navigator !== 'undefined' && (navigator as any).gpu) {
         executionProviders = ['webgpu'];
+        console.log('[AI] Using WebGPU backend');
       } else {
-        setStatus('Using WASM backend...');
+        console.log('[AI] WebGPU not available, using WASM backend');
+      }
+      setModelLoadProgress(20);
+
+      // Download model with fetch and progress tracking
+      console.log('[AI] Fetching model from:', FACE_SWAP_MODEL_URL);
+      const resp = await fetch(FACE_SWAP_MODEL_URL);
+      console.log('[AI] Fetch response:', resp.status, resp.statusText);
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
       }
 
-      setModelLoadProgress(30);
+      const totalBytes = parseInt(resp.headers.get('Content-Length') || '0');
+      console.log('[AI] Model size:', totalBytes);
+      setModelLoadProgress(25);
 
-      const session = await ort.InferenceSession.create(FACE_SWAP_MODEL_URL, {
+      let received = 0;
+      const reader = resp.body?.getReader();
+      if (!reader) {
+        throw new Error('Response body not readable');
+      }
+
+      // Animate progress while downloading
+      progressInterval = setInterval(() => {
+        const pct = totalBytes > 0
+          ? Math.min(90, 25 + Math.round((received / totalBytes) * 65))
+          : Math.min(90, 25 + Math.round(((Date.now() - startTime) / 30000) * 65));
+        setModelLoadProgress(pct);
+      }, 500);
+
+      const chunks: Uint8Array[] = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          received += value.length;
+        }
+      }
+      if (progressInterval) clearInterval(progressInterval);
+
+      // Assemble blob
+      const blob = new Blob(chunks);
+      console.log('[AI] Model downloaded, size:', blob.size, 'bytes in', Date.now() - startTime, 'ms');
+      setModelLoadProgress(90);
+
+      const modelBuffer = await blob.arrayBuffer();
+      console.log('[AI] Creating ONNX session from buffer...');
+      const session = await ort.InferenceSession.create(modelBuffer, {
         executionProviders,
         graphOptimizationLevel: 'all',
       });
 
+      console.log('[AI] ONNX session created. Inputs:', session.inputNames, 'Outputs:', session.outputNames);
       faceSwapSessionRef.current = session;
       setModelLoadProgress(100);
       setStatus('AI model loaded');
+      console.log('[AI] Model loaded in', Date.now() - startTime, 'ms');
     } catch (error) {
-      console.error('Failed to load face swap model:', error);
-      setStatus('AI model load failed - check connection');
+      if (progressInterval) clearInterval(progressInterval);
+      console.error('[AI] Failed to load face swap model:', error);
+      const errMsg = error instanceof Error ? error.message : String(error);
+      setStatus(`AI model load failed: ${errMsg.slice(0, 80)}`);
       setModelLoadProgress(0);
     }
   }, []);
@@ -242,14 +295,21 @@ export function useFaceTransform(): UseFaceTransformReturn {
     canvasH: number,
   ): Promise<FaceBox | null> => {
     const detector = detectorRef.current;
-    if (!detector) return null;
+    if (!detector) {
+      console.log('[AI] Face detector not initialized');
+      return null;
+    }
 
     try {
       const faces = await detector.estimateFaces(element, { flipHorizontal: false });
-      if (!faces.length) return null;
-
+      if (!faces.length) {
+        console.log('[AI] No face detected in frame');
+        return null;
+      }
+      console.log('[AI] Face detected, keypoints:', faces[0].keypoints.length);
       return getFaceBoxFromLandmarks(faces[0].keypoints, canvasW, canvasH);
-    } catch {
+    } catch (err) {
+      console.error('[AI] Face detection error:', err);
       return null;
     }
   }, [getFaceBoxFromLandmarks]);
@@ -321,6 +381,8 @@ export function useFaceTransform(): UseFaceTransformReturn {
     if (!session || !ort) return null;
 
     try {
+      console.log('[AI] runFaceSwap — inputNames:', session.inputNames, 'outputNames:', session.outputNames);
+
       // Prepare input tensors
       // inswapper expects: target face (128x128 RGB) and source embedding (512)
       const targetTensor = new ort.Tensor(
@@ -343,19 +405,31 @@ export function useFaceTransform(): UseFaceTransformReturn {
 
       const sourceTensor = new ort.Tensor('float32', sourceEmbedding, [1, 512]);
 
-      // Run inference
-      const feeds: Record<string, OrtType.Tensor> = {
-        target: targetTensor,
-        source: sourceTensor,
-      };
+      // Run inference — use actual model input names
+      const feeds: Record<string, OrtType.Tensor> = {};
+      // Map to generic names first, fall back to model names
+      if (session.inputNames.length >= 2) {
+        feeds[session.inputNames[0]] = sourceTensor;
+        feeds[session.inputNames[1]] = targetTensor;
+      } else {
+        feeds['source'] = sourceTensor;
+        feeds['target'] = targetTensor;
+      }
 
+      console.log('[AI] Running inference with feeds keys:', Object.keys(feeds));
       const results = await session.run(feeds);
+      console.log('[AI] Inference complete. Output keys:', Object.keys(results));
 
       // Get output tensor (swapped face)
-      const outputName = session.outputNames[0];
+      const outputName = session.outputNames[0] || Object.keys(results)[0];
       const outputTensor = results[outputName];
 
-      if (!outputTensor || !outputTensor.data) return null;
+      if (!outputTensor || !outputTensor.data) {
+        console.error('[AI] No output tensor found');
+        return null;
+      }
+
+      console.log('[AI] Output tensor shape:', outputTensor.dims);
 
       // Convert output back to ImageData
       const outputData = new Uint8ClampedArray(128 * 128 * 4);
@@ -370,9 +444,10 @@ export function useFaceTransform(): UseFaceTransformReturn {
         outputData[i * 4 + 3] = 255;
       }
 
+      console.log('[AI] Face swap output ready');
       return new ImageData(outputData, 128, 128);
     } catch (error) {
-      console.error('Face swap inference error:', error);
+      console.error('[AI] Face swap inference error:', error);
       return null;
     }
   }, []);
@@ -381,9 +456,13 @@ export function useFaceTransform(): UseFaceTransformReturn {
   const updateReferenceEmbedding = useCallback(async () => {
     if (refEmbeddingBusyRef.current) return;
     const refVid = refVideoRef.current;
-    if (!refVid || refVid.readyState < 2) return;
+    if (!refVid || refVid.readyState < 2) {
+      console.log('[AI] Ref video not ready, readyState:', refVid?.readyState);
+      return;
+    }
 
     refEmbeddingBusyRef.current = true;
+    console.log('[AI] Extracting reference face embedding...');
 
     try {
       // Capture current frame from reference video onto a proper canvas
@@ -391,23 +470,35 @@ export function useFaceTransform(): UseFaceTransformReturn {
       refCanvas.width = 640;
       refCanvas.height = 360;
       const refCtx = refCanvas.getContext('2d');
-      if (!refCtx) return;
+      if (!refCtx) {
+        refEmbeddingBusyRef.current = false;
+        return;
+      }
 
       refCtx.drawImage(refVid, 0, 0, 640, 360);
 
       // Detect face in reference
       const faceBox = await detectFaceBox(refCanvas, 640, 360);
       if (!faceBox) {
+        console.log('[AI] No face detected in reference video');
         setStatus('No face in reference video');
+        refEmbeddingBusyRef.current = false;
         return;
       }
+      console.log('[AI] Reference face detected at:', faceBox.x, faceBox.y, faceBox.width, faceBox.height);
 
       // Extract face crop
       const faceCrop = extractAlignedFace(refCtx, refCanvas, faceBox);
-      if (!faceCrop) return;
+      if (!faceCrop) {
+        console.log('[AI] Failed to extract face crop');
+        refEmbeddingBusyRef.current = false;
+        return;
+      }
+      console.log('[AI] Face crop extracted');
 
       // Generate embedding
       const embedding = generateFaceEmbedding(faceCrop);
+      console.log('[AI] Embedding generated, length:', embedding.length);
 
       refEmbeddingRef.current = {
         embedding,
@@ -415,8 +506,9 @@ export function useFaceTransform(): UseFaceTransformReturn {
       };
 
       setStatus('Reference face locked');
+      console.log('[AI] Reference face embedding cached');
     } catch (error) {
-      console.error('Failed to extract reference embedding:', error);
+      console.error('[AI] Failed to extract reference embedding:', error);
     } finally {
       refEmbeddingBusyRef.current = false;
     }
@@ -582,13 +674,22 @@ export function useFaceTransform(): UseFaceTransformReturn {
       ctx.drawImage(vid, 0, 0, W, H);
     }
 
-    // Update status
-    if (s.enabled && refEmbeddingRef.current) setStatus('AI Transformation Active');
-    else if (s.enabled && !faceSwapSessionRef.current) setStatus('Loading AI model...');
-    else if (s.enabled && !refEmbeddingRef.current) setStatus('Detecting reference face...');
-    else if (s.enabled) setStatus('Processing...');
-    else if (bgVal && bgImg?.complete) setStatus('Background Active');
-    else setStatus('Camera Ready');
+    // Update status — show model errors first, then processing state
+    const modelFailed = statusCacheRef.current.includes('AI model load failed');
+    const modelLoaded = !!faceSwapSessionRef.current;
+    if (s.enabled && modelFailed) {
+      // Keep error visible
+    } else if (s.enabled && !modelLoaded) {
+      setStatus('Loading AI model...');
+    } else if (s.enabled && !refEmbeddingRef.current) {
+      setStatus('Detecting reference face...');
+    } else if (s.enabled) {
+      setStatus('AI Transformation Active');
+    } else if (bgVal && bgImg?.complete) {
+      setStatus('Background Active');
+    } else {
+      setStatus('Camera Ready');
+    }
   }, [setStatus]);
 
   // Initialize transformation pipeline
