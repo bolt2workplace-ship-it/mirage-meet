@@ -1,5 +1,5 @@
 import { useRef, useState, useCallback, useEffect } from 'react';
-import * as ort from 'onnxruntime-web';
+import type * as OrtType from 'onnxruntime-web';
 import * as faceLandmarksDetection from '@tensorflow-models/face-landmarks-detection';
 import type { TransformationSettings, BackgroundOption } from '../types';
 
@@ -98,8 +98,11 @@ export function useFaceTransform(): UseFaceTransformReturn {
   // TensorFlow.js face landmark detector
   const detectorRef = useRef<faceLandmarksDetection.FaceLandmarksDetector | null>(null);
 
-  // ONNX inference sessions
-  const faceSwapSessionRef = useRef<ort.InferenceSession | null>(null);
+  // Lazily-loaded onnxruntime-web module (dynamic import to avoid blocking page load)
+  const ortRef = useRef<typeof OrtType | null>(null);
+
+  // ONNX inference session
+  const faceSwapSessionRef = useRef<OrtType.InferenceSession | null>(null);
 
   // MediaPipe Selfie Segmentation
   const selfieSegRef = useRef<any>(null);
@@ -162,27 +165,28 @@ export function useFaceTransform(): UseFaceTransformReturn {
     setStatus('Camera Ready');
   }, []);
 
-  // Initialize ONNX face swap model
+  // Initialize ONNX face swap model — loaded lazily so it never blocks page render
   const initFaceSwapModel = useCallback(async () => {
     try {
       setStatus('Loading AI transformation model...');
       setModelLoadProgress(10);
 
-      // Try WebGPU first, fall back to WASM
-      let executionProviders: string[] = ['webgpu'];
-      try {
-        // Check if WebGPU is available
-        if (!navigator.gpu) {
-          throw new Error('WebGPU not available');
-        }
-      } catch {
-        executionProviders = ['wasm'];
-        setStatus('Using WASM backend...');
-      }
+      // Dynamically import onnxruntime-web only when needed
+      const ort = await import('onnxruntime-web');
+      ortRef.current = ort;
 
       setModelLoadProgress(20);
 
-      // Create session with progress tracking
+      // Try WebGPU first, fall back to WASM
+      let executionProviders: string[] = ['wasm'];
+      if (typeof navigator !== 'undefined' && navigator.gpu) {
+        executionProviders = ['webgpu'];
+      } else {
+        setStatus('Using WASM backend...');
+      }
+
+      setModelLoadProgress(30);
+
       const session = await ort.InferenceSession.create(FACE_SWAP_MODEL_URL, {
         executionProviders,
         graphOptimizationLevel: 'all',
@@ -312,7 +316,8 @@ export function useFaceTransform(): UseFaceTransformReturn {
     sourceEmbedding: Float32Array,
   ): Promise<ImageData | null> => {
     const session = faceSwapSessionRef.current;
-    if (!session) return null;
+    const ort = ortRef.current;
+    if (!session || !ort) return null;
 
     try {
       // Prepare input tensors
@@ -329,16 +334,16 @@ export function useFaceTransform(): UseFaceTransformReturn {
         for (let x = 0; x < 128; x++) {
           const srcIdx = (y * 128 + x) * 4;
           const dstIdx = y * 128 + x;
-          targetTensor.data[dstIdx] = targetData[srcIdx] / 255.0; // R
-          targetTensor.data[128 * 128 + dstIdx] = targetData[srcIdx + 1] / 255.0; // G
-          targetTensor.data[2 * 128 * 128 + dstIdx] = targetData[srcIdx + 2] / 255.0; // B
+          (targetTensor.data as Float32Array)[dstIdx] = targetData[srcIdx] / 255.0;
+          (targetTensor.data as Float32Array)[128 * 128 + dstIdx] = targetData[srcIdx + 1] / 255.0;
+          (targetTensor.data as Float32Array)[2 * 128 * 128 + dstIdx] = targetData[srcIdx + 2] / 255.0;
         }
       }
 
       const sourceTensor = new ort.Tensor('float32', sourceEmbedding, [1, 512]);
 
       // Run inference
-      const feeds: Record<string, ort.Tensor> = {
+      const feeds: Record<string, OrtType.Tensor> = {
         target: targetTensor,
         source: sourceTensor,
       };
