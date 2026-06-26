@@ -50,26 +50,10 @@ export const backgroundOptions: BackgroundOption[] = [
   },
 ];
 
-interface FaceLandmarks {
-  // 6 key landmarks: left eye, right eye, nose tip, mouth left, mouth right, chin
-  leftEye: { x: number; y: number };
-  rightEye: { x: number; y: number };
-  noseTip: { x: number; y: number };
-  mouthLeft: { x: number; y: number };
-  mouthRight: { x: number; y: number };
-  chin: { x: number; y: number };
-  // Convex hull points for blending mask
-  outline: Array<{ x: number; y: number }>;
-  // Bounding box
-  box: { x: number; y: number; width: number; height: number };
-}
-
-interface RefFaceData {
-  landmarks: FaceLandmarks;
-  imageEl: HTMLImageElement | HTMLCanvasElement;
-  canvasW: number;
-  canvasH: number;
-}
+const SERVER = 'http://localhost:3001';
+// How often to send frames to the AI server (ms). 
+// CPU inference on inswapper takes ~200-500ms per frame, so 4fps is realistic.
+const TRANSFORM_INTERVAL_MS = 250;
 
 export function useFaceTransform(): UseFaceTransformReturn {
   const [processedStream, setProcessedStream] = useState<MediaStream | null>(null);
@@ -87,24 +71,25 @@ export function useFaceTransform(): UseFaceTransformReturn {
   const hostVideoRef = useRef<HTMLVideoElement | null>(null);
   const animFrameRef = useRef<number | null>(null);
   const bgImgRef = useRef<HTMLImageElement | null>(null);
+  const swappedFrameRef = useRef<HTMLImageElement | null>(null);
 
-  const faceMeshRef = useRef<any>(null);
   const selfieSegRef = useRef<any>(null);
   const segResultRef = useRef<any>(null);
-  const lastMeshResultRef = useRef<any>(null);
-
-  const refFaceDataRef = useRef<RefFaceData | null>(null);
-  const refFaceBusyRef = useRef(false);
+  const segBusyRef = useRef(false);
 
   const frameRef = useRef(0);
-  const segBusyRef = useRef(false);
-  const meshBusyRef = useRef(false);
-
   const settingsRef = useRef(transformationSettings);
   const refImageRef = useRef<HTMLImageElement | null>(null);
   const currentBgRef = useRef('');
   const statusCacheRef = useRef('');
   const initDoneRef = useRef(false);
+
+  // AI server state
+  const aiReadyRef = useRef(false);
+  const faceRegisteredRef = useRef(false);
+  const transformBusyRef = useRef(false);
+  const lastTransformRef = useRef(0);
+  const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const setStatus = useCallback((msg: string) => {
     if (statusCacheRef.current !== msg) {
@@ -125,270 +110,177 @@ export function useFaceTransform(): UseFaceTransformReturn {
       document.head.appendChild(s);
     }), []);
 
-  // Extract 6-point landmarks + outline from a FaceMesh result
-  const extractLandmarks = useCallback((results: any, W: number, H: number): FaceLandmarks | null => {
-    const lms = results?.multiFaceLandmarks?.[0];
-    if (!lms || lms.length < 468) return null;
+  // Poll AI server status until ready
+  const pollAIStatus = useCallback(() => {
+    if (statusPollRef.current) clearInterval(statusPollRef.current);
 
-    const pt = (i: number) => ({ x: lms[i].x * W, y: lms[i].y * H });
+    statusPollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(`${SERVER}/ai/status`);
+        if (!res.ok) return;
+        const data = await res.json();
 
-    // MediaPipe FaceMesh landmark indices
-    const leftEye = pt(159);     // left eye center
-    const rightEye = pt(386);    // right eye center
-    const noseTip = pt(1);       // nose tip
-    const mouthLeft = pt(61);    // mouth left corner
-    const mouthRight = pt(291);  // mouth right corner
-    const chin = pt(152);        // chin bottom
+        if (data.state === 'ready') {
+          aiReadyRef.current = true;
+          clearInterval(statusPollRef.current!);
+          statusPollRef.current = null;
+          setModelLoadProgress(100);
+          setStatus('AI Engine Ready');
+          console.log('[AI] Server-side AI engine is ready');
 
-    // Face oval outline indices for convex mask
-    const ovalIdx = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
-    const outline = ovalIdx.map(i => pt(i));
+          // If user already uploaded a reference image, register it now
+          if (refImageRef.current && !faceRegisteredRef.current) {
+            registerFaceWithServer(refImageRef.current);
+          }
+        } else if (data.state === 'downloading') {
+          const progValues = Object.values(data.progress || {}) as number[];
+          const avg = progValues.length > 0 ? progValues.reduce((a, b) => a + b, 0) / progValues.length : 0;
+          setModelLoadProgress(Math.round(avg * 0.8)); // downloading = 0-80%
+          setStatus(`Downloading AI models... ${data.progress ? Object.entries(data.progress).map(([k, v]) => `${k}:${v}%`).join(' ') : ''}`);
+        } else if (data.state === 'loading') {
+          setModelLoadProgress(85);
+          setStatus('Loading AI models into memory...');
+        } else if (data.state === 'error') {
+          clearInterval(statusPollRef.current!);
+          statusPollRef.current = null;
+          setModelLoadProgress(0);
+          setStatus(`AI Error: ${data.error}`);
+          console.error('[AI] Server error:', data.error);
+        } else {
+          // idle — server just started
+          setStatus('Waiting for AI server...');
+        }
+      } catch {
+        // Server not yet up, keep polling
+      }
+    }, 2000);
+  }, [setStatus]);
 
-    const xs = outline.map(p => p.x);
-    const ys = outline.map(p => p.y);
-    const box = {
-      x: Math.min(...xs),
-      y: Math.min(...ys),
-      width: Math.max(...xs) - Math.min(...xs),
-      height: Math.max(...ys) - Math.min(...ys),
-    };
+  // Register reference face image with the AI server
+  const registerFaceWithServer = useCallback(async (img: HTMLImageElement) => {
+    if (faceRegisteredRef.current) return;
+    if (!aiReadyRef.current) {
+      setStatus('AI models still loading, queued...');
+      return;
+    }
 
-    return { leftEye, rightEye, noseTip, mouthLeft, mouthRight, chin, outline, box };
-  }, []);
-
-  // Initialize FaceMesh — already in package.json, uses the installed @mediapipe/face_mesh
-  const initFaceMesh = useCallback(async () => {
-    setStatus('Loading face detection...');
-    setModelLoadProgress(10);
-
-    await loadScript('mp-face-mesh', 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js');
-
-    const FM = (window as any).FaceMesh;
-    if (!FM) throw new Error('FaceMesh not available');
-
-    const mesh = new FM({
-      locateFile: (f: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`,
-    });
-
-    mesh.setOptions({
-      maxNumFaces: 1,
-      refineLandmarks: false,
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence: 0.5,
-    });
-
-    mesh.onResults((results: any) => {
-      lastMeshResultRef.current = results;
-      meshBusyRef.current = false;
-    });
-
-    faceMeshRef.current = mesh;
-    setModelLoadProgress(50);
-    console.log('[AI] FaceMesh initialized');
-    setStatus('Camera Ready');
-    setModelLoadProgress(100);
-  }, [loadScript, setStatus]);
-
-  // Initialize Selfie Segmentation
-  const initSelfie = useCallback(async () => {
-    await loadScript('mp-selfie', 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js');
-    const SS = (window as any).SelfieSegmentation;
-    if (!SS) return;
-    const seg = new SS({ locateFile: (f: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${f}` });
-    seg.setOptions({ modelSelection: 1, selfieMode: false });
-    seg.onResults((r: any) => { segResultRef.current = r; segBusyRef.current = false; });
-    selfieSegRef.current = seg;
-    console.log('[AI] Selfie segmentation initialized');
-  }, [loadScript]);
-
-  // Run FaceMesh on a canvas/image element
-  const runFaceMesh = useCallback(async (
-    element: HTMLCanvasElement | HTMLImageElement | HTMLVideoElement
-  ): Promise<any> => {
-    const mesh = faceMeshRef.current;
-    if (!mesh) return null;
-
-    return new Promise((resolve) => {
-      const originalOnResults = mesh._listeners?.onResults;
-      const timeout = setTimeout(() => resolve(null), 3000);
-
-      const tempHandler = (results: any) => {
-        clearTimeout(timeout);
-        resolve(results);
-      };
-
-      mesh.onResults(tempHandler);
-      mesh.send({ image: element }).catch(() => {
-        clearTimeout(timeout);
-        resolve(null);
-      });
-    });
-  }, []);
-
-  // Extract reference face landmarks from uploaded image
-  const updateRefFace = useCallback(async () => {
-    if (refFaceBusyRef.current) return;
-    const refImg = refImageRef.current;
-    if (!refImg || !refImg.complete || refImg.naturalWidth === 0) return;
-
-    const mesh = faceMeshRef.current;
-    if (!mesh) return;
-
-    refFaceBusyRef.current = true;
-    console.log('[AI] Extracting reference face landmarks...');
+    setStatus('Detecting reference face...');
+    faceRegisteredRef.current = true;
 
     try {
-      // Draw reference image to a canvas so FaceMesh can read it
-      const refCanvas = document.createElement('canvas');
-      refCanvas.width = refImg.naturalWidth;
-      refCanvas.height = refImg.naturalHeight;
-      const ctx = refCanvas.getContext('2d');
-      if (!ctx) { refFaceBusyRef.current = false; return; }
-      ctx.drawImage(refImg, 0, 0);
+      // Convert HTMLImageElement to blob
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(img, 0, 0);
 
-      const results = await runFaceMesh(refCanvas);
-      const lms = extractLandmarks(results, refCanvas.width, refCanvas.height);
+      const blob: Blob = await new Promise(res => canvas.toBlob(b => res(b!), 'image/jpeg', 0.95));
+      const form = new FormData();
+      form.append('image', blob, 'reference.jpg');
 
-      if (!lms) {
-        console.log('[AI] No face in reference image');
-        setStatus('No face detected in photo');
-        refFaceBusyRef.current = false;
+      const res = await fetch(`${SERVER}/ai/register-face`, { method: 'POST', body: form });
+      const data = await res.json();
+
+      if (!res.ok) {
+        faceRegisteredRef.current = false;
+        setStatus(`Face detection failed: ${data.error}`);
         return;
       }
 
-      refFaceDataRef.current = {
-        landmarks: lms,
-        imageEl: refCanvas,
-        canvasW: refCanvas.width,
-        canvasH: refCanvas.height,
+      console.log('[AI] Reference face registered:', data);
+      setStatus('Reference face registered');
+    } catch (err: any) {
+      faceRegisteredRef.current = false;
+      setStatus(`Registration error: ${err.message}`);
+    }
+  }, [setStatus]);
+
+  // When referenceImage changes, register it
+  useEffect(() => {
+    if (referenceImage) {
+      faceRegisteredRef.current = false; // reset so it re-registers
+      if (aiReadyRef.current) {
+        registerFaceWithServer(referenceImage);
+      }
+    } else {
+      faceRegisteredRef.current = false;
+      fetch(`${SERVER}/ai/clear-face`, { method: 'POST' }).catch(() => {});
+    }
+  }, [referenceImage, registerFaceWithServer]);
+
+  // Send a frame to the AI server for transformation
+  const sendFrameForTransform = useCallback(async (videoEl: HTMLVideoElement) => {
+    if (transformBusyRef.current) return;
+    if (!aiReadyRef.current || !faceRegisteredRef.current) return;
+
+    const now = Date.now();
+    if (now - lastTransformRef.current < TRANSFORM_INTERVAL_MS) return;
+    lastTransformRef.current = now;
+    transformBusyRef.current = true;
+
+    try {
+      // Capture current video frame at reduced resolution for speed
+      const W = Math.min(640, videoEl.videoWidth);
+      const H = Math.round(W * videoEl.videoHeight / videoEl.videoWidth);
+      const cap = document.createElement('canvas');
+      cap.width = W; cap.height = H;
+      cap.getContext('2d')!.drawImage(videoEl, 0, 0, W, H);
+
+      const blob: Blob = await new Promise(res => cap.toBlob(b => res(b!), 'image/jpeg', 0.85));
+      const form = new FormData();
+      form.append('frame', blob, 'frame.jpg');
+
+      const res = await fetch(`${SERVER}/ai/transform-frame`, { method: 'POST', body: form });
+
+      if (res.status === 204) {
+        // No face detected in frame — clear swapped frame
+        swappedFrameRef.current = null;
+        transformBusyRef.current = false;
+        return;
+      }
+
+      if (!res.ok) {
+        transformBusyRef.current = false;
+        return;
+      }
+
+      const jpegBlob = await res.blob();
+      const url = URL.createObjectURL(jpegBlob);
+      const img = document.createElement('img');
+      img.onload = () => {
+        // Revoke old URL
+        if (swappedFrameRef.current?.src?.startsWith('blob:')) {
+          URL.revokeObjectURL(swappedFrameRef.current.src);
+        }
+        swappedFrameRef.current = img;
+        transformBusyRef.current = false;
       };
-
-      console.log('[AI] Reference face landmarks locked');
-      setStatus('Reference face locked');
-    } catch (err) {
-      console.error('[AI] Reference face extraction error:', err);
-    } finally {
-      refFaceBusyRef.current = false;
+      img.onerror = () => { transformBusyRef.current = false; };
+      img.src = url;
+    } catch {
+      transformBusyRef.current = false;
     }
-  }, [extractLandmarks, runFaceMesh, setStatus]);
-
-  // Compute affine transform matrix from src triangle to dst triangle
-  const getAffineTransform = useCallback((
-    src: [number, number][],
-    dst: [number, number][]
-  ): DOMMatrix => {
-    // Solve the 2x3 affine matrix that maps src -> dst
-    const [s0, s1, s2] = src;
-    const [d0, d1, d2] = dst;
-
-    const srcM = [
-      [s0[0], s0[1], 1, 0, 0, 0],
-      [0, 0, 0, s0[0], s0[1], 1],
-      [s1[0], s1[1], 1, 0, 0, 0],
-      [0, 0, 0, s1[0], s1[1], 1],
-      [s2[0], s2[1], 1, 0, 0, 0],
-      [0, 0, 0, s2[0], s2[1], 1],
-    ];
-    const dstV = [d0[0], d0[1], d1[0], d1[1], d2[0], d2[1]];
-
-    // Gaussian elimination (6x6)
-    const A = srcM.map((row, i) => [...row, dstV[i]]);
-    for (let col = 0; col < 6; col++) {
-      let maxRow = col;
-      for (let row = col + 1; row < 6; row++) {
-        if (Math.abs(A[row][col]) > Math.abs(A[maxRow][col])) maxRow = row;
-      }
-      [A[col], A[maxRow]] = [A[maxRow], A[col]];
-      if (Math.abs(A[col][col]) < 1e-10) continue;
-      const pivot = A[col][col];
-      for (let j = col; j <= 6; j++) A[col][j] /= pivot;
-      for (let row = 0; row < 6; row++) {
-        if (row === col) continue;
-        const f = A[row][col];
-        for (let j = col; j <= 6; j++) A[row][j] -= f * A[col][j];
-      }
-    }
-
-    const [a, b, tx, c, d, ty] = A.map(row => row[6]);
-    return new DOMMatrix([a ?? 1, c ?? 0, b ?? 0, d ?? 1, tx ?? 0, ty ?? 0]);
   }, []);
 
-  // Blend reference face onto target frame using affine warp
-  const blendFaceOntoFrame = useCallback((
-    ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
-    W: number,
-    H: number,
-    hostLandmarks: FaceLandmarks,
-    refData: RefFaceData,
-  ) => {
-    const { landmarks: refLm, imageEl, canvasW: rW, canvasH: rH } = refData;
-    const hLm = hostLandmarks;
+  // Selfie segmentation for background replacement
+  const initSelfie = useCallback(async () => {
+    try {
+      await loadScript('mp-selfie', 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js');
+      const SS = (window as any).SelfieSegmentation;
+      if (!SS) return;
+      const seg = new SS({ locateFile: (f: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${f}` });
+      seg.setOptions({ modelSelection: 1, selfieMode: false });
+      seg.onResults((r: any) => { segResultRef.current = r; segBusyRef.current = false; });
+      selfieSegRef.current = seg;
+      console.log('[AI] Selfie segmentation initialized');
+    } catch (err) {
+      console.warn('[AI] Selfie segmentation failed:', err);
+    }
+  }, [loadScript]);
 
-    // Use 3 anchor points for stable affine warp: eye centers + chin
-    const srcTri: [number, number][] = [
-      [refLm.leftEye.x, refLm.leftEye.y],
-      [refLm.rightEye.x, refLm.rightEye.y],
-      [refLm.chin.x, refLm.chin.y],
-    ];
-    const dstTri: [number, number][] = [
-      [hLm.leftEye.x, hLm.leftEye.y],
-      [hLm.rightEye.x, hLm.rightEye.y],
-      [hLm.chin.x, hLm.chin.y],
-    ];
-
-    const matrix = getAffineTransform(srcTri, dstTri);
-
-    // Create a face canvas: warp reference image into host face position
-    const faceCanvas = new OffscreenCanvas(W, H);
-    const fCtx = faceCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
-    fCtx.save();
-    fCtx.setTransform(matrix);
-    fCtx.drawImage(imageEl, 0, 0, rW, rH);
-    fCtx.restore();
-
-    // Create mask from host face outline
-    const maskCanvas = new OffscreenCanvas(W, H);
-    const mCtx = maskCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
-
-    // Expand mask slightly for better coverage
-    const cx = hLm.box.x + hLm.box.width / 2;
-    const cy = hLm.box.y + hLm.box.height / 2;
-    const expandX = 1.05;
-    const expandY = 1.1;
-
-    mCtx.beginPath();
-    hLm.outline.forEach((pt, i) => {
-      const ex = cx + (pt.x - cx) * expandX;
-      const ey = cy + (pt.y - cy) * expandY;
-      if (i === 0) mCtx.moveTo(ex, ey);
-      else mCtx.lineTo(ex, ey);
-    });
-    mCtx.closePath();
-
-    // Feathered mask for seamless blending
-    const grad = mCtx.createRadialGradient(cx, cy, hLm.box.width * 0.25, cx, cy, hLm.box.width * 0.55);
-    grad.addColorStop(0, 'rgba(255,255,255,1)');
-    grad.addColorStop(0.7, 'rgba(255,255,255,0.9)');
-    grad.addColorStop(1, 'rgba(255,255,255,0)');
-    mCtx.fillStyle = grad;
-    mCtx.fill();
-
-    // Apply mask to warped face
-    const blendCanvas = new OffscreenCanvas(W, H);
-    const bCtx = blendCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
-    bCtx.drawImage(faceCanvas, 0, 0);
-    bCtx.globalCompositeOperation = 'destination-in';
-    bCtx.drawImage(maskCanvas, 0, 0);
-    bCtx.globalCompositeOperation = 'source-over';
-
-    // Colour-correct: sample average colour in host face region and match to ref face
-    // (simple multiply blend to reduce stark colour differences)
-    ctx.drawImage(blendCanvas, 0, 0);
-  }, [getAffineTransform]);
-
-  // Main render loop
   const startRenderLoop = useCallback(() => {
-    const tick = async () => {
+    const tick = () => {
       const vid = hostVideoRef.current;
       const out = outputCanvasRef.current;
       const s = settingsRef.current;
@@ -397,41 +289,34 @@ export function useFaceTransform(): UseFaceTransformReturn {
       const frame = frameRef.current;
 
       if (vid && out && vid.readyState >= 2) {
-        const W = out.width;
-        const H = out.height;
+        const W = out.width, H = out.height;
 
-        // Selfie segmentation
+        // Selfie segmentation every 2 frames
         if (!segBusyRef.current && selfieSegRef.current && frame % 2 === 0) {
           segBusyRef.current = true;
           selfieSegRef.current.send({ image: vid }).catch(() => { segBusyRef.current = false; });
         }
 
-        // FaceMesh on host camera
-        if (s.enabled && !meshBusyRef.current && frame % 3 === 0) {
-          meshBusyRef.current = true;
-          faceMeshRef.current?.send({ image: vid }).catch(() => { meshBusyRef.current = false; });
+        // Send to AI server for transformation
+        if (s.enabled && faceRegisteredRef.current) {
+          sendFrameForTransform(vid);
         }
 
-        // Extract ref face when image loaded but not yet processed
-        if (s.enabled && refImageRef.current && !refFaceDataRef.current && !refFaceBusyRef.current) {
-          updateRefFace();
-        }
-
-        renderFrame(W, H);
+        renderFrame(W, H, s);
       }
 
       animFrameRef.current = requestAnimationFrame(tick);
     };
     animFrameRef.current = requestAnimationFrame(tick);
-  }, [updateRefFace]);
+  }, [sendFrameForTransform]);
 
-  const renderFrame = useCallback((W: number, H: number) => {
+  const renderFrame = useCallback((W: number, H: number, s: TransformationSettings) => {
     const out = outputCanvasRef.current;
     const vid = hostVideoRef.current;
     const seg = segResultRef.current;
     const bgImg = bgImgRef.current;
     const bgVal = currentBgRef.current;
-    const s = settingsRef.current;
+    const swapped = swappedFrameRef.current;
 
     if (!out || !vid || vid.readyState < 2) return;
     const ctx = out.getContext('2d');
@@ -439,7 +324,7 @@ export function useFaceTransform(): UseFaceTransformReturn {
 
     ctx.clearRect(0, 0, W, H);
 
-    // 1. Background
+    // 1. Background layer
     if (bgVal && bgImg?.complete && bgImg.naturalWidth > 0) {
       ctx.drawImage(bgImg, 0, 0, W, H);
     } else {
@@ -447,53 +332,34 @@ export function useFaceTransform(): UseFaceTransformReturn {
       ctx.fillRect(0, 0, W, H);
     }
 
-    // 2. Draw person (with optional segmentation mask)
-    if (seg?.segmentationMask && vid.readyState >= 2) {
+    // 2. Person layer (transformed or original)
+    const sourceFrame = (s.enabled && swapped?.complete && swapped.naturalWidth > 0) ? swapped : vid;
+
+    if (seg?.segmentationMask && bgVal) {
       const personOff = new OffscreenCanvas(W, H);
       const pCtx = personOff.getContext('2d') as OffscreenCanvasRenderingContext2D;
-
-      // Draw camera frame
-      pCtx.drawImage(vid, 0, 0, W, H);
-
-      // 3. Face transformation overlay
-      if (s.enabled && refFaceDataRef.current && lastMeshResultRef.current) {
-        const hostLm = extractLandmarks(lastMeshResultRef.current, W, H);
-        if (hostLm) {
-          blendFaceOntoFrame(pCtx, W, H, hostLm, refFaceDataRef.current);
-        }
-      }
-
-      // Apply segmentation mask (remove background)
-      if (bgVal) {
-        pCtx.globalCompositeOperation = 'destination-in';
-        pCtx.drawImage(seg.segmentationMask, 0, 0, W, H);
-        pCtx.globalCompositeOperation = 'source-over';
-      }
-
+      pCtx.drawImage(sourceFrame, 0, 0, W, H);
+      pCtx.globalCompositeOperation = 'destination-in';
+      pCtx.drawImage(seg.segmentationMask, 0, 0, W, H);
+      pCtx.globalCompositeOperation = 'source-over';
       ctx.drawImage(personOff, 0, 0);
     } else {
-      ctx.drawImage(vid, 0, 0, W, H);
-
-      // Face transformation without segmentation
-      if (s.enabled && refFaceDataRef.current && lastMeshResultRef.current) {
-        const hostLm = extractLandmarks(lastMeshResultRef.current, W, H);
-        if (hostLm) {
-          blendFaceOntoFrame(ctx, W, H, hostLm, refFaceDataRef.current);
-        }
-      }
+      ctx.drawImage(sourceFrame, 0, 0, W, H);
     }
 
-    // Status update
-    if (s.enabled && !refFaceDataRef.current) {
-      setStatus('Detecting reference face...');
-    } else if (s.enabled) {
+    // Status
+    if (s.enabled && swapped) {
       setStatus('AI Transformation Active');
+    } else if (s.enabled && faceRegisteredRef.current) {
+      setStatus('Processing frames...');
+    } else if (s.enabled && !faceRegisteredRef.current) {
+      setStatus('Waiting for reference face...');
     } else if (bgVal && bgImg?.complete) {
       setStatus('Background Active');
     } else {
       setStatus('Camera Ready');
     }
-  }, [blendFaceOntoFrame, extractLandmarks, setStatus]);
+  }, [setStatus]);
 
   const initializeTransform = useCallback(async (stream: MediaStream) => {
     if (initDoneRef.current) return;
@@ -526,14 +392,15 @@ export function useFaceTransform(): UseFaceTransformReturn {
     stream.getAudioTracks().forEach(t => outStream.addTrack(t));
     setProcessedStream(outStream);
 
-    await Promise.all([
-      initSelfie().catch(err => console.warn('[AI] Selfie failed:', err)),
-      initFaceMesh().catch(err => console.warn('[AI] FaceMesh failed:', err)),
-    ]);
+    // Start selfie segmentation (non-blocking)
+    initSelfie();
+
+    // Start polling AI server status
+    pollAIStatus();
 
     startRenderLoop();
     setIsProcessing(false);
-  }, [initSelfie, initFaceMesh, startRenderLoop]);
+  }, [initSelfie, pollAIStatus, startRenderLoop]);
 
   const updateBackground = useCallback((backgroundId: string) => {
     const opt = backgroundOptions.find(o => o.id === backgroundId);
@@ -553,20 +420,21 @@ export function useFaceTransform(): UseFaceTransformReturn {
 
   const cleanup = useCallback(() => {
     if (animFrameRef.current) { cancelAnimationFrame(animFrameRef.current); animFrameRef.current = null; }
+    if (statusPollRef.current) { clearInterval(statusPollRef.current); statusPollRef.current = null; }
     try { selfieSegRef.current?.close(); } catch { /* noop */ }
-    try { faceMeshRef.current?.close(); } catch { /* noop */ }
     selfieSegRef.current = null;
-    faceMeshRef.current = null;
     if (hostVideoRef.current) { hostVideoRef.current.pause(); hostVideoRef.current.srcObject = null; hostVideoRef.current = null; }
+    if (swappedFrameRef.current?.src?.startsWith('blob:')) URL.revokeObjectURL(swappedFrameRef.current.src);
+    swappedFrameRef.current = null;
     bgImgRef.current = null;
     outputCanvasRef.current = null;
     segResultRef.current = null;
-    lastMeshResultRef.current = null;
-    refFaceDataRef.current = null;
     currentBgRef.current = '';
     frameRef.current = 0;
     segBusyRef.current = false;
-    meshBusyRef.current = false;
+    transformBusyRef.current = false;
+    aiReadyRef.current = false;
+    faceRegisteredRef.current = false;
     initDoneRef.current = false;
     setProcessedStream(null);
     setIsProcessing(false);

@@ -3,6 +3,8 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import multer from 'multer';
+import { initialize, registerReferenceFace, transformFrame, clearReference, getInitState } from './faceSwap.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -48,6 +50,47 @@ app.post('/create-room', (req, res) => {
     participants: new Map(),
   });
   res.json({ roomId });
+});
+
+// ─── AI Transformation Endpoints ─────────────────────────────────────────────
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+
+// Get AI engine status
+app.get('/ai/status', (req, res) => {
+  res.json(getInitState());
+});
+
+// Register reference face (host uploads a photo)
+app.post('/ai/register-face', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No image provided' });
+    const result = await registerReferenceFace(req.file.buffer);
+    res.json(result);
+  } catch (err) {
+    console.error('[Server] register-face error:', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Transform a single JPEG frame
+app.post('/ai/transform-frame', upload.single('frame'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No frame provided' });
+    const resultJpeg = await transformFrame(req.file.buffer);
+    if (!resultJpeg) return res.status(204).end(); // no face detected, use original
+    res.set('Content-Type', 'image/jpeg');
+    res.send(resultJpeg);
+  } catch (err) {
+    console.error('[Server] transform-frame error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Clear reference face
+app.post('/ai/clear-face', (req, res) => {
+  clearReference();
+  res.json({ success: true });
 });
 
 io.on('connection', (socket) => {
@@ -176,4 +219,11 @@ function generateRoomId() {
 const PORT = process.env.PORT || 3001;
 httpServer.listen(PORT, () => {
   console.log(`Signaling server running on port ${PORT}`);
+
+  // Start AI model initialization in background (non-blocking)
+  initialize((progress) => {
+    console.log(`[AI] ${progress.state}: ${progress.message || ''}`);
+  }).catch(err => {
+    console.error('[AI] Initialization failed:', err.message);
+  });
 });
