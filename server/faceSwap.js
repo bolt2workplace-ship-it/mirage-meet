@@ -548,6 +548,25 @@ async function getEmbedding(pixels, W, H, kps) {
 
 // ─── InSwapper emap extraction ────────────────────────────────────────────────
 
+/** Safely convert a protobufjs int64 value (may be Long object) to JS number. */
+function toNum(v) {
+  if (v == null) return 0;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'bigint') return Number(v);
+  // protobufjs Long object: has .low and .high
+  if (typeof v === 'object' && typeof v.toNumber === 'function') return v.toNumber();
+  return Number(v);
+}
+
+/** Make an alignment-safe Float32Array from a raw_data bytes field. */
+function rawToFloat32(raw, count) {
+  // raw may be a Buffer with non-zero byteOffset — copy to fresh buffer first
+  const safe = Buffer.allocUnsafe(count * 4);
+  const src  = Buffer.from(raw.buffer ?? raw, raw.byteOffset ?? 0, count * 4);
+  src.copy(safe);
+  return new Float32Array(safe.buffer, safe.byteOffset, count);
+}
+
 async function loadSwapperEmap() {
   try {
     const buf = await readFile(MODEL_PATHS.swapper);
@@ -577,25 +596,81 @@ async function loadSwapperEmap() {
 
     const model = root.lookupType('ModelProto').decode(buf);
     const inits = model.graph?.initializer ?? [];
-    for (let i = inits.length - 1; i >= 0; i--) {
+    console.log('[FaceSwap] loadSwapperEmap: found', inits.length, 'initializers');
+
+    // Strategy 0: exact name match — most reliable
+    for (let i = 0; i < inits.length; i++) {
       const t = inits[i];
-      const dims = Array.from(t.dims ?? []).map(Number);
-      if (dims.length === 2 && dims[0] === 512 && dims[1] === 512) {
-        if (t.raw_data?.length >= 512 * 512 * 4) {
-          const arr = new Float32Array(t.raw_data.buffer, t.raw_data.byteOffset, 512 * 512);
-          console.log('[FaceSwap] emap extracted from model initializer', i);
+      if (t.name === 'emap') {
+        const rawLen = t.raw_data?.length ?? 0;
+        if (rawLen >= 512 * 512 * 4) {
+          const arr = rawToFloat32(t.raw_data, 512 * 512);
+          console.log('[FaceSwap] emap found by name at initializer', i);
           return Float32Array.from(arr);
         }
-        if (t.float_data?.length === 512 * 512) {
-          console.log('[FaceSwap] emap (float_data) extracted from initializer', i);
+        if ((t.float_data?.length ?? 0) === 512 * 512) {
+          console.log('[FaceSwap] emap (float_data) found by name at initializer', i);
           return Float32Array.from(t.float_data);
         }
       }
     }
-    console.warn('[FaceSwap] emap not found — identity pass-through');
+
+    // Search backwards — emap is typically the last initializer (mirrors Python: graph.initializer[-1])
+    for (let i = inits.length - 1; i >= 0; i--) {
+      const t = inits[i];
+      // Use toNum() to safely handle protobufjs Long objects for int64 dims
+      const dims = Array.from(t.dims ?? []).map(toNum);
+      const rawLen   = t.raw_data?.length ?? 0;
+      const floatLen = t.float_data?.length ?? 0;
+      const total    = dims.reduce((a, b) => a * b, 1);
+
+      // Log every candidate that could be the 512×512 emap
+      if (dims.some(d => d === 512)) {
+        console.log('[FaceSwap] Candidate initializer', i, 'name:', t.name,
+          'dims:', dims, 'raw_len:', rawLen, 'float_len:', floatLen);
+      }
+
+      if (dims.length === 2 && dims[0] === 512 && dims[1] === 512) {
+        if (rawLen >= 512 * 512 * 4) {
+          const arr = rawToFloat32(t.raw_data, 512 * 512);
+          console.log('[FaceSwap] emap extracted from initializer', i, '(raw_data, 512x512)');
+          return Float32Array.from(arr);
+        }
+        if (floatLen === 512 * 512) {
+          console.log('[FaceSwap] emap extracted from initializer', i, '(float_data, 512x512)');
+          return Float32Array.from(t.float_data);
+        }
+      }
+
+      // Fallback: accept any shape whose total element count is 512*512 (some models flatten it)
+      if (total === 512 * 512) {
+        if (rawLen >= 512 * 512 * 4) {
+          const arr = rawToFloat32(t.raw_data, 512 * 512);
+          console.log('[FaceSwap] emap extracted from initializer', i, '(raw_data, flat 262144, dims:', dims, ')');
+          return Float32Array.from(arr);
+        }
+        if (floatLen === 512 * 512) {
+          console.log('[FaceSwap] emap extracted from initializer', i, '(float_data, flat 262144)');
+          return Float32Array.from(t.float_data);
+        }
+      }
+    }
+
+    // Last-resort: take the very last initializer with sufficient raw bytes (Python: graph.initializer[-1])
+    for (let i = inits.length - 1; i >= 0; i--) {
+      const t = inits[i];
+      const rawLen = t.raw_data?.length ?? 0;
+      if (rawLen >= 512 * 512 * 4) {
+        const arr = rawToFloat32(t.raw_data, 512 * 512);
+        console.log('[FaceSwap] emap last-resort: using initializer', i, 'raw_len:', rawLen);
+        return Float32Array.from(arr);
+      }
+    }
+
+    console.warn('[FaceSwap] emap not found in any initializer — identity pass-through');
     return null;
   } catch (e) {
-    console.warn('[FaceSwap] emap load error:', e.message);
+    console.warn('[FaceSwap] emap load error:', e.message, e.stack?.split('\n')[1] ?? '');
     return null;
   }
 }
